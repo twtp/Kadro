@@ -1,0 +1,153 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use ToolsPlus::RateCompareV2;
+use ToolsPlus::Utilities;
+use Data::Dumper;
+use JSON qw//;
+
+#
+# USED BY THE WAREHOUSE PROGRAM
+# USED BY PO/INV
+#
+# this basically shims between the freight calculation frontend
+# in the warehouse and TP::RCv2
+#
+
+# $ENV{QUERY_STRING} = "type=item&item0=CAHA123-BRN-MED&qty0=1&zipcode=02766&state=MA&country=US&residential=1&carrier0=UPS&carrier1=USPS";
+# $ENV{QUERY_STRING} = "type=item&item0=CAHA123-BRN-MED&qty0=10&zipcode=02766&state=MA&country=US&residential=1&carrier0=UPS&carrier1=USPS";
+# $ENV{QUERY_STRING} = "type=item&item0=BCADSBE1006&qty0=1&zipcode=02766&state=MA&country=US&residential=1&carrier0=UPS&carrier1=USPS";
+
+our $rates;
+if (!defined($rates)) {
+    $rates = ToolsPlus::RateCompareV2->new(
+        db_interface => 'IIS',
+        do_autoload  => 1,
+      );
+}
+
+$rates->reset;
+
+my %pairs = ToolsPlus::Utilities::parse_get_post_string($ENV{QUERY_STRING});
+if (!_is_valid_request(%pairs)) {
+    print "Status: 400 Bad Request\nContent-type: text/plain\n\n\n";
+}
+else {
+    
+    if ($pairs{type} eq 'box') {
+        my $boxes = _pull_boxes(%pairs);
+        if (defined($boxes)) {
+            foreach (@$boxes) {
+                $rates->create_and_add_package(%$_, insurance_value => 0);
+            }
+        }
+    }
+    elsif ($pairs{type} eq 'item') {
+        my $items = _pull_items(%pairs);
+        if (defined($items)) {
+            $rates->pack_by_item_numbers(%$items);
+        }
+    }
+    # other types here?
+    
+    my $engines = _pull_engines(%pairs);
+    
+    if (!$rates->has_packages || scalar @$engines == 0) {
+        print "Status: 400 Bad Request\nContent-type: text/plain\n\nMissing weight and dimensions on one or more items\n";
+    }
+    else {
+        $rates->set_shipping_information(
+            country => $pairs{country},
+            zipcode => $pairs{zipcode},
+            state   => $pairs{state},
+            residential => $pairs{residential},
+          );
+        
+        my %response = $rates->compare(@$engines);
+        print "Status:200 OK\nContent-type: text/plain\n\n" . JSON->new->utf8->convert_blessed->encode(\%response);
+    }
+}
+
+sub _is_valid_request {
+    my %pairs = @_;
+    
+    return 0 unless exists($pairs{type});
+    return 0 unless $pairs{type} eq 'item' || $pairs{type} eq 'box';
+    
+    if ($pairs{type} eq 'item') {
+        return 0 unless exists($pairs{item0});
+        return 0 unless exists($pairs{qty0});
+    }
+    elsif ($pairs{type} eq 'box') {
+        return 0 unless exists($pairs{boxweight0});
+        return 0 unless exists($pairs{boxlength0});
+        return 0 unless exists($pairs{boxwidth0});
+        return 0 unless exists($pairs{boxheight0});
+    }
+    # other types here, itemnumber?
+    
+    return 0 unless exists($pairs{zipcode});
+    return 0 unless exists($pairs{country});
+    return 0 unless exists($pairs{state});
+    return 0 unless exists($pairs{residential});
+    
+    return 0 unless exists($pairs{carrier0});
+    
+    return 1;
+}
+
+sub _pull_boxes {
+    my %pairs = @_;
+    
+    
+    my @boxes;
+    foreach (grep { /^box(weight|length|width|height)(\d+)$/ } keys %pairs) {
+        my ($field, $num) = $_ =~ /^box(weight|length|width|height)(\d+)$/;
+        $boxes[$num]{$field} = $pairs{$_};
+    }
+    
+    foreach (@boxes) {
+        return undef unless defined $_;
+        return undef unless exists($_->{weight})
+                         && exists($_->{length})
+                         && exists($_->{width})
+                         && exists($_->{height});
+    }
+
+   
+    
+    return \@boxes;
+}
+
+sub _pull_items {
+    my %pairs = @_;
+    
+    my @temp;
+    foreach (grep { /^(item|qty)(\d+)$/ } keys %pairs) {
+        my ($field, $num) = $_ =~ /^(item|qty)(\d+)$/;
+        $temp[$num]{$field} = $pairs{$_};
+    }
+    
+    my %items;
+    foreach (@temp) {
+        return undef unless defined $_;
+        return undef unless exists($_->{item}) && exists($_->{item});
+        
+        $items{ $_->{item} } = $_->{qty};
+    }
+    
+    return \%items;
+}
+
+sub _pull_engines {
+    my %pairs = @_;
+    
+    my @engines;
+    foreach (grep { /^carrier(\d+)$/ } keys %pairs) {
+        push @engines, $pairs{$_};
+    }
+    
+    return \@engines;
+}
